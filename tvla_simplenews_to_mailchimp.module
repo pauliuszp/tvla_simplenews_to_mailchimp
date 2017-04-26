@@ -1,0 +1,747 @@
+<?php
+
+/*
+ * Simple data structure - Bag. One can push, pull (no rules what is pulled
+ * firstly), check if there is an element in bag.
+ */
+
+class Bag {
+  
+  private $bag = array ();
+    
+    public function __construct ($values=null) {
+      $this->push_bulk($values);        
+    }
+    
+    public function push_bulk($values) {       
+        
+      if (!($values==null) && is_array($values)) {
+        foreach ($values as $value) {
+          $this->push($value);
+        }
+      }
+    }
+    
+    public function push ($value) {
+        
+      if ($this->key($value)===false) {
+        $this->bag[]=$value;
+      }
+    }
+    
+    public function pull ($value=null) {
+      
+      if (empty($this->bag)) {
+        return false;
+      }
+      
+      if ($value===null) {
+        $value=array_pop($this->bag);
+        return $value;
+      }
+        
+      $key=$this->key($value);
+      
+    if ($key===false) {
+      return false;
+    }
+      
+      $value_from_bag=$this->bag[$key];
+      unset ($this->bag[$key]);
+      return $value_from_bag;
+    }
+    
+    public function is_empty () {
+      return empty ($this->bag);
+    }
+    
+    public function key ($value) {
+      return array_search($value,$this->bag);
+    }
+    
+    public function dpm_all () {
+      foreach ($this->bag as $value) {
+        dpm ($value);
+      }
+    }
+}
+
+function tvla_simplenews_to_mailchimp_bag_test () {
+    $bag = new Bag ();
+    dpm ($bag->pull());
+    $bag->push('AAA');
+    $bag->push('AA');
+    $bag->push('A');
+    dpm($bag->key('CCC'));
+    dpm($bag->key('AAA'));
+    dpm($bag->pull('AA'));
+    dpm($bag->pull());
+    dpm($bag->pull());
+    dpm($bag->pull());
+}
+
+/**
+ * Main function of module, that is directly executed after form at
+ * menu submit
+ * 
+ * @param Boolean $delete_lists - if true, unsubscribed lists are deleted at 
+ * Mailchimp
+ * 
+ * @return
+ */
+
+function simplenews_to_mailchimp ($delete_lists=false) {
+
+  // Get lists, subscribers from Mailchimp, put them on arrays
+  $mc_lists=simplenews_to_mailchimp_get_mailchimp_lists();
+  $mc_lists_members = array();
+  $mc_list_f=array();
+  $mc_list_f['ids']=array();
+  $mc_list_f['names']=array();
+  $mc_list_f['ids_names']=array ();
+   
+  foreach ($mc_lists->lists as $value) {
+    $name=$value->name;
+    $list=$value->id;
+    $mc_list_f['ids'][]=$list;
+    $mc_list_f['names'][$name][]=$list;
+    $mc_list_f['ids_names'][$list]=$name;
+    $mc_lists_members[$name][$list]['members'] = array();
+    $mc_lists_members[$name][$list]['emails'] = array();
+    $mc_lists_members[$name][$list]['subscribed_emails']=array();
+    $mc_lists_members[$name][$list]['unsubscribed_emails']=array();
+        
+    $members=simplenews_to_mailchimp_get_members_of_mailchimp_list($list);
+     
+    foreach ($members->members as $member) {
+      $mc_lists_members[$name][$list]['members'][] =$member;
+      $mc_lists_members[$name][$list]['emails'][]=$member->email_address;
+    
+      if ($member->status=='subscribed') {
+        $mc_lists_members[$name][$list]['subscribed_emails'][]=$member->email_address;
+      } elseif ($member->status=='unsubscribed') {
+        $mc_lists_members[$name][$list]['unsubscribed_emails'][]=$member->email_address;
+      }
+    }
+  }
+  
+  //Get categories, subscribers from SimpleNews, put them on arrays
+  $sn_cats=simplenews_categories_load_multiple();
+  $sn_cats_members = array ();
+  
+  foreach ($sn_cats as $list=>$value) {
+    $name=$value->name.' ['.$list.']';
+    $sn_cats_members[$name] = array();
+    $members=simplenews_get_subscriptions_by_list($list);
+    $sn_cats_members[$name]['name']=$value->name;
+    $sn_cats_members[$name]['permission_reminder']=variable_get('simple_news_to_mailchimp_reminder');
+    $sn_cats_members[$name]['campaign_defaults']=array (
+            'from_email'=>$value->from_address,
+            'from_name'=>$value->from_name,
+            'subject'=>$value->name,
+            'language'=>variable_get('simple_news_to_mailchimp_language'));
+    $sn_cats_members[$name]['members']=array();
+    $sn_cats_members[$name]['emails']=array();
+    
+    foreach ($members as $member) {
+      $sn_cats_members[$name]['members'][] =$member;  
+      $sn_cats_members[$name]['emails'][] =$member->mail; 
+    }
+  }
+  
+  //Compare Mailchimp and Simplenews lists (categories)
+  //see, what lists should be created, what should be unsubscribed
+  $res=simplenews_to_mailchimp_compare_lists ($sn_cats_members,$mc_lists_members,$mc_list_f);
+  $new_lists_names=$res['add'];
+  $lists_to_unsubscribe_ids=$res['unsubscribe'];
+  
+  //Delete lists at Mailchimp if $delete_lists==true, or unsubscribe all memebers of them
+  if ($delete_lists) {
+    simplenews_to_mailchimp_delete_mailchimp_lists($lists_to_unsubscribe_ids);
+  } else {
+    simplenews_to_mailchimp_unsubscribe_lists ($lists_to_unsubscribe_ids,$mc_list_f,$mc_lists_members);
+  }
+  
+  //Compare members of lists at Mailchimp that match categories at Simplenews
+  simplenews_to_mailchimp_compare_and_change_matching_lists ($sn_cats_members,$mc_lists_members, $new_lists_names, $mc_list_f);
+  
+  //Create new lists at mailchimp and populate them with members
+  simplenews_to_mailchimp_create_new_lists_with_members ($new_lists_names, $sn_cats_members);
+}
+
+/**
+ * Delete list at mailchimp
+ * 
+ * @param Bag of $lists_ids to be deleted 
+ * 
+ * @return
+ */
+
+function simplenews_to_mailchimp_delete_mailchimp_lists ($lists_to_delete) {
+  
+  if (!($lists_to_delete instanceof Bag)) {
+    return false;
+  }
+  
+  $list_id=$lists_to_delete->pull();
+  while (!$list_id==null) {
+    simplenews_to_mailchimp_delete_list_at_mailchimp ($list_id);
+    $list_id=$lists_to_delete->pull();
+  }
+}
+
+/*
+ * Unsubscribe all members of list at Mailchimp
+ * 
+ * @param Bag of $list_ids to be deleted
+ * @param  $mc_list_f,$mc_lists_members - data structures created at simlenews_to_mailchimp
+ * 
+ * @return
+ */
+
+function simplenews_to_mailchimp_unsubscribe_lists ($list_ids,$mc_list_f,$mc_lists_members) {
+  
+  if (!($list_ids instanceof Bag)) {
+    return false;
+  }
+  
+  $list_id=$list_ids->pull();
+  while (!$list_id==null) {
+    $name=$mc_list_f['ids_names'][$list_id];
+    $emails=$mc_lists_members[$name][$list_id]['emails'];
+    simplenews_to_mailchimp_unsubscribe_members_from_list ($list_id, $emails);
+    $list_id=$list_ids->pull();
+  }
+  
+  return true;
+}
+
+/**
+ * Helper function that creates array, that will be used as parameter to batch 
+ * request for subsribing member (email) to Mailchimp list
+ * 
+ * @param $list_id, $email
+ * 
+ * @return array 
+ */
+
+function simplenews_to_mailchimp_batch_subscribe_prepare ($list_id, $email) {
+  
+  $path='lists/'.$list_id.'/members';
+  $batch_op=array ('method'=>'POST',
+                   'path'=>$path,
+                   'body'=>json_encode(array ('status'=>'subscribed',
+                                              'email_address'=>$email)));
+  return $batch_op;
+}
+
+/**
+ * Helper function that creates array, that will be used as parameter to batch 
+ * request for resubscribing an unsubscribed member (email) to Mailchimp list
+ * 
+ * @param $list_id, $email
+ * 
+ * @return array 
+ */
+
+function simplenews_to_mailchimp_batch_resubscribe_prepare ($list_id, $email) {
+  
+  $path='lists/'.$list_id.'/members/'.md5(strtolower($email));
+  $batch_op=array ('method'=>'PATCH',
+                   'path'=>$path,
+                   'body'=>json_encode(array ('status'=>'subscribed')));
+  return $batch_op;
+}
+
+/**
+ * Helper function that creates array, that will be used as parameter to batch 
+ * request for unsubscribing member (email) from Mailchimp list
+ * 
+ * @param $list_id, $email
+ * 
+ * @return array 
+ */
+
+function simplenews_to_mailchimp_batch_unscribe_prepare ($list_id, $email) {
+ 
+  $path='lists/'.$list_id.'/members/'.md5(strtolower($email));
+  $batch_op=array ('method'=>'PATCH',
+                   'path'=>$path,
+                   'body'=>json_encode(array ('status'=>'unsubscribed')));
+  return $batch_op;
+}
+
+
+
+/**
+ * Helper function that creates array, that will be used as parameter to batch 
+ * request for unsubscribing all members (emails) from Mailchimp list
+ * 
+ * @param $list_id, $emails
+ * 
+ * @return array 
+ */
+
+function simplenews_to_mailchimp_unsubscribe_members_from_list ($list_id, $emails) {
+  
+  $batch_ops=array ();
+  
+  foreach ($emails as $email) {
+    $batch_ops['operations'][]=simplenews_to_mailchimp_batch_unscribe_prepare($list_id,$email);
+  }
+  
+  return simplenews_to_mailchimp_execute_batch ($batch_ops);
+}
+
+/**
+ * Creates new lists at Mailchimp and populates them with members
+ * 
+ * @param Bag $new_lists_names 
+ * @param $sn_cats_members
+ * 
+ * @return
+ */
+
+function simplenews_to_mailchimp_create_new_lists_with_members ($new_lists_names, $sn_cats_members) {
+  
+  if (!($new_lists_names instanceof Bag)) {
+    return false;
+  }
+  
+  $batch_ops=array();
+  $new_list_name=$new_lists_names->pull();
+
+  while (!$new_list_name==null) {
+    $creation_response=simplenews_to_mailchimp_new_list_at_mailchimp ($new_list_name, $sn_cats_members[$new_list_name]);
+    
+    if (is_object($creation_response) && !empty ($creation_response->id)) {
+      $new_list_id=$creation_response->id;
+        foreach ($sn_cats_members[$new_list_name]['emails'] as $email) {
+          $batch_ops['operations'][]=simplenews_to_mailchimp_batch_subscribe_prepare ($new_list_id, $email);
+        }
+    }
+    
+    $new_list_name=$new_lists_names->pull();
+  }
+  
+  if (($batch_ops!==null)) {
+    simplenews_to_mailchimp_execute_batch ($batch_ops);
+  }
+}
+
+/**
+ * Compare members of Mailchimp lists and Simplenews categories
+ * 
+ * @param Bag $new_lists_names 
+ * @param $sn_cats_members, $mc_lists_members, $mc_list_f
+ * 
+ * @return
+ */
+
+function simplenews_to_mailchimp_compare_and_change_matching_lists ($sn_cats_members,$mc_lists_members, $new_lists_names, $mc_list_f) {
+  
+  if (!($new_lists_names instanceof Bag)) {
+    return false;
+  }
+  
+  $batch_ops=array ();
+  
+  foreach ($sn_cats_members as $name=>$value) {
+    
+    if ($new_lists_names->key($name)===false) {
+      $list_id=$mc_list_f['names'][$name][0];
+      
+      foreach ($sn_cats_members[$name]['emails'] as $email) {
+        
+        if (array_search($email,$mc_lists_members[$name][$list_id]['subscribed_emails'])===false) {
+          
+          if (array_search($email,$mc_lists_members[$name][$list_id]['unsubscribed_emails'])===false) {
+            $batch_ops['operations'][]=simplenews_to_mailchimp_batch_subscribe_prepare ($list_id, $email);
+          } else {
+            $batch_ops['operations'][]=simplenews_to_mailchimp_batch_resubscribe_prepare ($list_id, $email);
+          }
+        }
+      }
+           
+      foreach ($mc_lists_members[$name][$list_id]['subscribed_emails'] as $email) {
+        
+        if (array_search($email, $sn_cats_members[$name]['emails'])===false) {
+          $batch_ops['operations'][]=simplenews_to_mailchimp_batch_unscribe_prepare($list_id,$email);
+        }
+      }
+    }
+  }
+  
+  if (($batch_ops!==null)) {
+    simplenews_to_mailchimp_execute_batch ($batch_ops);
+  }
+}
+
+/**
+ * Compare Mailchimp and Simplenews lists (categories)
+ * see, what lists should be created, what should be unsubscribed (deleted)
+ * 
+ * @param $sn_cats_members, $mc_lists_members, $mc_list_f
+ * 
+ * @return array 
+ */
+
+function simplenews_to_mailchimp_compare_lists ($sn_cats_members,$mc_lists_members,$mc_list_f) {
+ 
+  $lists_to_unscribe=new Bag($mc_list_f['ids']);
+  $lists_to_add=new Bag ();
+  
+  foreach ($sn_cats_members as $name=>$members) {
+    
+    if (!empty($mc_list_f['names'][$name])) {
+      $cat_id=$mc_list_f['names'][$name][0];
+      $lists_to_unscribe->pull($cat_id);
+    } else {
+      $lists_to_add->push($name);
+    }
+  }
+  
+  return array ('unsubscribe'=>$lists_to_unscribe,'add'=>$lists_to_add);
+}
+
+/**
+ * Delete Mailchimp  list 
+ * 
+ * @param $list_id
+ * 
+ * @return array 
+ */
+
+function simplenews_to_mailchimp_delete_list_at_mailchimp ($list_id) {
+  
+  $endpoint='/lists/'.$list_id;
+  $response=simplenews_to_mailchimp_handle_curl_request($endpoint,'DELETE',null);
+  return $response;
+}
+
+/**
+ * Create new list at Mailchimp 
+ * 
+ * @param $list, $cat_date
+ * 
+ * @return array of response data
+ */
+
+function simplenews_to_mailchimp_new_list_at_mailchimp ($list,$cat_data) {
+  
+  $endpoint='/lists/';
+  //$account=mailchimp_get_api_object();
+  
+  $account=simplenews_to_mailchimp_get_mailchimp_account ();
+  $contact=$account->contact;
+  $contact->address1=$contact->addr1;
+  $contact_json=json_encode((object) $contact);
+    
+  $new_list=array('name'=>$list,
+                  'permission_reminder'=>$cat_data['permission_reminder'],
+                  'email_type_option'=>true,
+                  'contact'=>$contact,
+                  'campaign_defaults'=>array ('from_email'=>$cat_data['campaign_defaults']['from_email'],
+                                              'from_name'=>$cat_data['campaign_defaults']['from_name'],
+                                              'subject'=>$cat_data['campaign_defaults']['subject'],
+                                              'language'=>$cat_data['campaign_defaults']['language']));
+  return simplenews_to_mailchimp_handle_curl_request ($endpoint, 'POST', $new_list);
+}
+
+/**
+ * Get all lists from Mailchimp
+ * 
+ * @param 
+ * 
+ * @return array of response data
+ */
+
+function simplenews_to_mailchimp_get_mailchimp_lists () {
+  
+  $endpoint='/lists/';
+  $response=simplenews_to_mailchimp_handle_curl_request($endpoint,'GET',null);
+  return $response;
+}
+
+/**
+ * Helper function that gets Mailchimp account data
+ * 
+ * @param 
+ * 
+ * @return array 
+ */
+
+function simplenews_to_mailchimp_get_mailchimp_account () {
+  
+  $endpoint='/';
+  $response=simplenews_to_mailchimp_handle_curl_request($endpoint,'GET',null);
+  return $response;
+}
+
+/**
+ * Get all members of a list from Mailchimp
+ * 
+ * @param $list_id
+ * 
+ * @return array of response data
+ */
+
+function simplenews_to_mailchimp_get_members_of_mailchimp_list ($list_id) {
+
+  $endpoint='/lists/'.$list_id.'/members';
+  
+  //MAX number of memebers at Mailchimp list!!!!
+  $params=array('count'=>10000);
+  $response=simplenews_to_mailchimp_handle_curl_request($endpoint,'GET',$params);
+  return $response;
+}
+
+/**
+ * Executes batch operation request
+ * 
+ * @param array $batch_op
+ * 
+ * @return array of response data
+ */
+
+function simplenews_to_mailchimp_execute_batch ($batch_op) {
+  
+  $endpoint='/batches';   
+  $response=simplenews_to_mailchimp_handle_curl_request($endpoint,'POST',$batch_op);
+  return $response;
+}
+
+/**
+ * Helper function that creates and handles CURL request to api.mailchimp.com/3.0
+ * with given params
+ * 
+ * @param $endpoint, $method, $params
+ * 
+ * @return array of response data
+ */
+
+function simplenews_to_mailchimp_handle_curl_request ($endpoint, $method, $params) {
+  
+  $root = 'https://us1.api.mailchimp.com/3.0';
+  $api_user = 'apikey';
+  
+  //$api_key=variable_get('mailchimp_api_key', '');
+  $api_key=variable_get('simple_news_to_mailchimp_api_key', '');
+  
+  if ($api_key==='') {
+    $errors=array ('Mailchimp API key is not set');
+    return array ('error'=>true,
+                  'errors'=>$errors);
+  }
+  
+  $api_key_parts = explode('-', $api_key);
+  $data_center=(isset($api_key_parts[1])) ? $api_key_parts[1] : 'us12';
+  $root = str_replace('us1', $data_center, $root);
+  $ch = curl_init($root.$endpoint);
+  if ($method=='GET' && !($params==null)) {
+    $params_string='?';
+    
+    foreach ($params as $key=>$value) {
+      $params_string = $params_string.$key.'='.$value.'?';
+    }
+    
+    $params_string = substr ($params_string,0,strlen($params_string)-1);
+    $ch = curl_init($root.$endpoint.$params_string);
+  }
+    
+  $autorization=$api_user . ' ' . $api_key;
+  $headers =array ( 'Authorization: '.$autorization);
+  curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+  
+  if ($method=='DELETE') {
+    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "DELETE");
+  }
+  
+  if ($method=='POST') {
+    curl_setopt($ch, CURLOPT_POST, TRUE);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode((object) $params));
+  }
+  
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+  $response = curl_exec($ch);
+  $response_data=json_decode($response);
+  return $response_data;
+}
+
+/**
+ * Returns array of Drupal form for configuration and execution
+ * 
+ * @param 
+ * 
+ * @return array 
+ */
+
+function simplenews_to_mailchimp_config_form() {
+  
+  $form = array();
+  $form['contact'] = array(
+    '#type' => 'fieldset', 
+    '#title' => t('Synchronize Mailchimp with SimpleNews'), 
+    '#description'=>t('First of all checks if there are lists at Mailchimp that '
+      . 'do not exist at SimpleNews (as categories), unsubscribes users '
+      . 'from them (if DELETE LISTS option is selected deletes these lists, '
+      . 'then adds new categories from SimpleNews to Mailchimp with corresponding '
+      . 'users, then checks and updates Mailchimp lists that match to Simple News '
+      . 'categories'),
+  '#weight' => 5, 
+  '#collapsible' => FALSE, 
+  '#collapsed' => FALSE,
+  'elements'=> array( 'api_key' =>array('#type' => 'textfield',
+                                        '#title' => t('API key'),
+                                        '#default_value' => variable_get('simple_news_to_mailchimp_api_key', ''),
+                                        '#description' => t('Enter API key from yout Mailchimp account'),
+                                        '#required' => TRUE),
+                      'remainder'=>array('#type' => 'textarea',
+                                         '#title' => t('Reminder'),
+                                         '#default_value' => variable_get('simple_news_to_mailchimp_reminder', 'You have subscribed at '.variable_get('site_name', "Default site name")),
+                                         '#description' => t('Mailchimp requires short reminder text for the list that is newly created'),
+                                         '#required' => TRUE),
+                     'language'=>array('#type' => 'textfield',
+                                       '#title' => t('Language'),
+                                       '#default_value' => variable_get('simple_news_to_mailchimp_language', 'ES'),
+                                       '#description' => t('Mailchimp requires language for list that is newly created'),
+                                       '#required' => TRUE),
+                     'delete_lists'=> array ('#type' => 'checkbox',
+                                              '#title' => t('DELETE LISTS at Mailchimp'),
+                                              '#default_value' => FALSE,
+                                              '#description' => '!!!IMPORTANT!!! this can cause PERMANENT MEMEBERS DELETION at Mailchimp'),
+                     'submit'=>array ('#type' => 'submit',
+                                      '#value' => t('Start')),
+                      )
+    );
+
+
+  return $form;
+}
+
+/**
+ * Implements hook_menu () for setting menu item
+ * 
+ * @param
+ * 
+ * @return array 
+ */
+
+function tvla_simplenews_to_mailchimp_menu() {
+
+  $items = array();
+
+  $items['admin/config/services/sn_to_mc'] = array(
+    'title' => 'SimpleNews to Mailchimp settings',
+    'description' => 'Synchronizes Mailchimp with SimpleNews',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('simplenews_to_mailchimp_config_form'),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer users'),
+    //array('administer onthisdate settings'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+ return $items;
+}
+
+/**
+ * Implements form_name_submit (), executes simplenews_to_mailchimp (), when 
+ * form from menu is submitted
+ * 
+ * @param $form, &$form_state
+ * 
+ * @return
+ */
+
+function simplenews_to_mailchimp_config_form_submit($form, &$form_state) {
+  
+  if (isset ($form_state['values']['remainder'])) {
+    variable_set('simple_news_to_mailchimp_reminder',$form_state['values']['remainder']);
+  }
+  
+  if (isset ($form_state['values']['api_key'])) {
+    variable_set('simple_news_to_mailchimp_api_key',$form_state['values']['api_key']);
+  }
+  
+  if (isset ($form_state['values']['language'])) {
+    variable_set('simple_news_to_mailchimp_language',$form_state['values']['language']);
+  }
+  
+  if (isset ($form_state['values']['delete_lists'])) {
+    
+    if ($form_state['values']['delete_lists']==1) {
+      simplenews_to_mailchimp (true);
+    } else {
+      simplenews_to_mailchimp (false);
+    }
+  }
+  $form_state['rebuild'] = TRUE;
+}
+
+/**
+ * Implements hook_form_alter ()
+ * 
+ * @param $&$form, &$form_state, $form_id
+ * 
+ * @return
+ */
+
+function tvla_simplenews_to_mailchimp_form_alter(&$form, &$form_state, $form_id) {
+  
+  if ($form_id=='simplenews_to_mailchimp_config_form') {
+  
+    if (isset($form_state['input']['op'])) {
+      $form['contact']['elements']['passed']=array ('#type'=>'markup',
+                                                    '#markup' => '<div> Synchronization passed </div>');
+    } 
+  } 
+}
+
+/**
+ * Function for testing - deletes users created by test_create
+ * 
+ * @param $prefix, $email_suff , $count
+ * 
+ * @return
+ */
+
+function simplenews_to_mailchimp_test_delete ($prefix, $email_suff , $count) {
+  
+  for ($i=0; $i<$count; $i++) {
+    $name=$prefix.$i;
+    $email=$name.'@'.$email_suff;
+    $user=user_load_by_mail ($email);
+    $uid=$user->uid;
+    user_delete($uid);
+  }
+}
+
+/**
+ * Function for testing - deletes users created by test_create
+ * 
+ * @param $prefix, $email_suff , $count, $tid
+ * 
+ * @return
+ */
+
+function simplenews_to_mailchimp_test_create ($prefix, $email_suff , $count, $tid) {
+  
+  for ($i=0; $i<$count; $i++) {
+    $name=$prefix.$i;
+    $email=$name.'@'.$email_suff;
+    $newUser = array(
+            'name' => $name,
+            'mail' => $email,
+            'status' => 1,
+            'init' => $email,
+            'roles' => array(
+                  DRUPAL_AUTHENTICATED_RID => 'authenticated user',
+                  3 => 'custom role')
+            );
+    user_save(null, $newUser);
+    simplenews_subscribe_user($email, $tid,false);
+  }
+} 
+
+
