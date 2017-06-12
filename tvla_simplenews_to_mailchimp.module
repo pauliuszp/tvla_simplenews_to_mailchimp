@@ -1,4 +1,11 @@
 <?php
+define ('TVLA_TO_MC_NO_AUTOMATIC_UPDATE',0);
+define ('TVLA_TO_MC_DIRECT_UPDATE',1);
+define ('TVLA_TO_MC_UPDATE_USING_CRON',2);
+
+define ('TVLA_TO_MC_DO_NOT_CHANGE',0);
+define ('TVLA_TO_MC_UNSUBSCRIBE',1);
+define ('TVLA_TO_MC_DELETE',2);
 
 /*
  * Simple data structure - Bag. One can push, pull (no rules what is pulled
@@ -90,7 +97,7 @@ function tvla_simplenews_to_mailchimp_bag_test () {
  * @return
  */
 
-function simplenews_to_mailchimp ($delete_lists=false) {
+function simplenews_to_mailchimp ($unexpected_data=TVLA_TO_MC_DO_NOT_CHANGE) {
 
   // Get lists, subscribers from Mailchimp, put them on arrays
   $mc_lists=simplenews_to_mailchimp_get_mailchimp_lists();
@@ -156,17 +163,66 @@ function simplenews_to_mailchimp ($delete_lists=false) {
   $lists_to_unsubscribe_ids=$res['unsubscribe'];
   
   //Delete lists at Mailchimp if $delete_lists==true, or unsubscribe all memebers of them
-  if ($delete_lists) {
+  if ($unexpected_data==TVLA_TO_MC_DELETE) {
     simplenews_to_mailchimp_delete_mailchimp_lists($lists_to_unsubscribe_ids);
-  } else {
+  } 
+  else if ($unexpected_data==TVLA_TO_MC_UNSUBSCRIBE) {
     simplenews_to_mailchimp_unsubscribe_lists ($lists_to_unsubscribe_ids,$mc_list_f,$mc_lists_members);
   }
   
   //Compare members of lists at Mailchimp that match categories at Simplenews
-  simplenews_to_mailchimp_compare_and_change_matching_lists ($sn_cats_members,$mc_lists_members, $new_lists_names, $mc_list_f);
+  simplenews_to_mailchimp_compare_and_change_matching_lists ($sn_cats_members,$mc_lists_members, $new_lists_names, $mc_list_f, $unexpected_data);
   
   //Create new lists at mailchimp and populate them with members
   simplenews_to_mailchimp_create_new_lists_with_members ($new_lists_names, $sn_cats_members);
+}
+
+function tvla_simplenews_to_mailchimp_format_mc_list_name ($name,$tid) {
+    $name_f=$name.' ['.$tid.']';
+    return $name_f;
+}
+
+function tvla_simplenews_to_mailchimp_format_mc_lists ($mc_lists, $include_members=false) {
+  
+  $mc_lists_members = array();
+  $mc_list_f=array();
+  $mc_list_f['ids']=array();
+  $mc_list_f['names']=array();
+  $mc_list_f['ids_names']=array ();
+   
+  foreach ($mc_lists->lists as $value) {
+    $name=$value->name;
+    $list=$value->id;
+    $mc_list_f['ids'][]=$list;
+    $mc_list_f['names'][$name][]=$list;
+    $mc_list_f['ids_names'][$list]=$name;
+    if ($include_members) {
+        $mc_lists_members[$name][$list]['members'] = array();
+        $mc_lists_members[$name][$list]['emails'] = array();
+        $mc_lists_members[$name][$list]['subscribed_emails']=array();
+        $mc_lists_members[$name][$list]['unsubscribed_emails']=array();
+        
+        $members=simplenews_to_mailchimp_get_members_of_mailchimp_list($list);
+     
+        foreach ($members->members as $member) {
+           $mc_lists_members[$name][$list]['members'][] =$member;
+           $mc_lists_members[$name][$list]['emails'][]=$member->email_address;
+    
+            if ($member->status=='subscribed') {
+                $mc_lists_members[$name][$list]['subscribed_emails'][]=$member->email_address;
+            } 
+            elseif ($member->status=='unsubscribed') {
+                $mc_lists_members[$name][$list]['unsubscribed_emails'][]=$member->email_address;
+            }
+        }
+    }
+  }
+  if ($include_members) {
+    return ([$mc_list_f,$mc_list_members]);
+  }
+  else {
+    return $mc_list_f;
+  }
 }
 
 /**
@@ -232,6 +288,15 @@ function simplenews_to_mailchimp_batch_subscribe_prepare ($list_id, $email) {
                    'path'=>$path,
                    'body'=>json_encode(array ('status'=>'subscribed',
                                               'email_address'=>$email)));
+  return $batch_op;
+}
+
+function simplenews_to_mailchimp_batch_delete_email_prepare ($list_id, $email) {
+  
+  $path='lists/'.$list_id.'/members/'.md5(strtolower($email));
+  $batch_op=array (
+    'method'=>'DELETE',
+    'path'=>$path);
   return $batch_op;
 }
 
@@ -338,7 +403,8 @@ function simplenews_to_mailchimp_create_new_lists_with_members ($new_lists_names
  * @return
  */
 
-function simplenews_to_mailchimp_compare_and_change_matching_lists ($sn_cats_members,$mc_lists_members, $new_lists_names, $mc_list_f) {
+function simplenews_to_mailchimp_compare_and_change_matching_lists (
+  $sn_cats_members,$mc_lists_members, $new_lists_names, $mc_list_f, $unexpected_data) {
   
   if (!($new_lists_names instanceof Bag)) {
     return false;
@@ -362,11 +428,18 @@ function simplenews_to_mailchimp_compare_and_change_matching_lists ($sn_cats_mem
           }
         }
       }
-           
-      foreach ($mc_lists_members[$name][$list_id]['subscribed_emails'] as $email) {
+      $all_emails=array_merge($mc_lists_members[$name][$list_id]['subscribed_emails'],$mc_lists_members[$name][$list_id]['unsubscribed_emails']);    
+      foreach ($all_emails as $email) {
         
         if (array_search($email, $sn_cats_members[$name]['emails'])===false) {
-          $batch_ops['operations'][]=simplenews_to_mailchimp_batch_unscribe_prepare($list_id,$email);
+          if ($unexpected_data==TVLA_TO_MC_UNSUBSCRIBE) {
+            $batch_ops['operations'][]=simplenews_to_mailchimp_batch_unscribe_prepare($list_id,$email);
+          }
+          else if ($unexpected_data==TVLA_TO_MC_DELETE) {
+            dpm ('DELETE');
+            $batch_ops['operations'][]=simplenews_to_mailchimp_batch_delete_email_prepare ($list_id, $email);
+          }
+          
         }
       }
     }
@@ -579,41 +652,75 @@ function simplenews_to_mailchimp_handle_curl_request ($endpoint, $method, $param
 function simplenews_to_mailchimp_config_form() {
   
   $form = array();
-  $form['contact'] = array(
+  
+  
+  $form['settings'] = array(
     '#type' => 'fieldset', 
-    '#title' => t('Synchronize Mailchimp with SimpleNews'), 
+    '#title' => t('Settings'), 
+    '#weight' => 5, 
+    '#collapsible' => FALSE, 
+    '#collapsed' => FALSE,
+    'elements'=> array( 
+      'api_key' =>array(
+        '#type' => 'textfield',
+        '#title' => t('API key'),
+        '#default_value' => variable_get('simple_news_to_mailchimp_api_key', ''),
+        '#description' => t('Enter API key from yout Mailchimp account'),
+        '#required' => TRUE),
+      'remainder'=>array(
+        '#type' => 'textarea',
+        '#title' => t('Reminder'),
+        '#default_value' => variable_get('simple_news_to_mailchimp_reminder', 'You have subscribed at '.variable_get('site_name', "Default site name")),
+        '#description' => t('Mailchimp requires short reminder text for the list that is newly created'),
+        '#required' => TRUE),
+      'language'=>array('#type' => 'textfield',
+        '#title' => t('Language'),
+        '#default_value' => variable_get('simple_news_to_mailchimp_language', 'ES'),
+        '#description' => t('Mailchimp requires language for list that is newly created'),
+        '#required' => TRUE),
+      'auto_updates'=> array (
+        '#type' => 'radios',
+        '#title' => t('Automated updates'),
+        '#default_value' => variable_get('simple_news_to_mailchimp_auto_update',TVLA_TO_MC_NO_AUTOMATIC_UPDATE),
+        '#options' => array (
+          TVLA_TO_MC_NO_AUTOMATIC_UPDATE=>'Disabled',
+          TVLA_TO_MC_DIRECT_UPDATE=>'Direct after new subscribtion on SimpleNews',
+          TVLA_TO_MC_UPDATE_USING_CRON=>'Delayed using CRON'),                                             ),
+        '#description' => 'Updates can be done later using cron or directly after new subscribtion on SimpleNews'),
+        'submit'=>array (
+          '#type' => 'submit',
+          '#value' => 'Save'),
+      
+  );
+  $form['instant_synchro'] = array(
+    '#type' => 'fieldset', 
+    '#title' => t('Update Mailchimp account instantly using data from SimpleNews'), 
+    '#weight' => 6, 
+    '#collapsible' => FALSE, 
+    '#collapsed' => FALSE,
     '#description'=>t('First of all checks if there are lists at Mailchimp that '
       . 'do not exist at SimpleNews (as categories), unsubscribes users '
       . 'from them (if DELETE LISTS option is selected deletes these lists, '
       . 'then adds new categories from SimpleNews to Mailchimp with corresponding '
       . 'users, then checks and updates Mailchimp lists that match to Simple News '
       . 'categories'),
-  '#weight' => 5, 
-  '#collapsible' => FALSE, 
-  '#collapsed' => FALSE,
-  'elements'=> array( 'api_key' =>array('#type' => 'textfield',
-                                        '#title' => t('API key'),
-                                        '#default_value' => variable_get('simple_news_to_mailchimp_api_key', ''),
-                                        '#description' => t('Enter API key from yout Mailchimp account'),
-                                        '#required' => TRUE),
-                      'remainder'=>array('#type' => 'textarea',
-                                         '#title' => t('Reminder'),
-                                         '#default_value' => variable_get('simple_news_to_mailchimp_reminder', 'You have subscribed at '.variable_get('site_name', "Default site name")),
-                                         '#description' => t('Mailchimp requires short reminder text for the list that is newly created'),
-                                         '#required' => TRUE),
-                     'language'=>array('#type' => 'textfield',
-                                       '#title' => t('Language'),
-                                       '#default_value' => variable_get('simple_news_to_mailchimp_language', 'ES'),
-                                       '#description' => t('Mailchimp requires language for list that is newly created'),
-                                       '#required' => TRUE),
-                     'delete_lists'=> array ('#type' => 'checkbox',
-                                              '#title' => t('DELETE LISTS at Mailchimp'),
-                                              '#default_value' => FALSE,
-                                              '#description' => '!!!IMPORTANT!!! this can cause PERMANENT MEMEBERS DELETION at Mailchimp'),
-                     'submit'=>array ('#type' => 'submit',
-                                      '#value' => t('Start')),
-                      )
-    );
+    'elements'=> array(
+      'behavior_unexpected_data'=> array (
+        '#type' => 'radios',
+        '#title' => t('What should be done, if lists or emails are found at Mailchimp, that do not exist at SimpleNews?'),
+        '#default_value' =>TVLA_TO_MC_DO_NOT_CHANGE,
+        '#options'=>array (
+          TVLA_TO_MC_DO_NOT_CHANGE=>'Do nothing',
+          TVLA_TO_MC_UNSUBSCRIBE=>'Unsubscribe',
+          TVLA_TO_MC_DELETE=>'Delete !!!IMPORTANT - this can cause PERMANENT emails DELETION at Mailchimp!!!'
+        ),
+      'submit'=>array (
+        '#type' => 'submit',
+        '#value' => 'Start',
+        '#weight'=>1),
+      )
+    )
+  );
 
 
   return $form;
@@ -654,8 +761,9 @@ function tvla_simplenews_to_mailchimp_menu() {
  * @return
  */
 
-function simplenews_to_mailchimp_config_form_submit($form, &$form_state) {
-  
+function tvla_simplenews_to_mailchimp_save_form_settings($form, &$form_state) {
+ 
+ 
   if (isset ($form_state['values']['remainder'])) {
     variable_set('simple_news_to_mailchimp_reminder',$form_state['values']['remainder']);
   }
@@ -667,14 +775,34 @@ function simplenews_to_mailchimp_config_form_submit($form, &$form_state) {
   if (isset ($form_state['values']['language'])) {
     variable_set('simple_news_to_mailchimp_language',$form_state['values']['language']);
   }
+  if (isset($form_state['values']['auto_updates'])) {
+      variable_set('simple_news_to_mailchimp_auto_update',$form_state['values']['auto_updates']);
+  }
+}
+
+function simplenews_to_mailchimp_config_form_submit($form, &$form_state) {
+  $auto_update_before=variable_get('simple_news_to_mailchimp_auto_update',TVLA_TO_MC_NO_AUTOMATIC_UPDATE);
   
-  if (isset ($form_state['values']['delete_lists'])) {
+  tvla_simplenews_to_mailchimp_save_form_settings($form, $form_state);
+  
+  $auto_update_after=variable_get('simple_news_to_mailchimp_auto_update',TVLA_TO_MC_NO_AUTOMATIC_UPDATE);
+  
+  if ($auto_update_before==TVLA_TO_MC_UPDATE_USING_CRON && 
+    $auto_update_after!==TVLA_TO_MC_UPDATE_USING_CRON) {
     
-    if ($form_state['values']['delete_lists']==1) {
-      simplenews_to_mailchimp (true);
-    } else {
-      simplenews_to_mailchimp (false);
-    }
+    tvla_simplenews_to_mailchimp_flush_emails_from_db_to_mc ();
+    
+  }
+  
+  
+  $unexpected_data=isset($form_state['values']['behavior_unexpected_data']) ? 
+    $form_state['values']['behavior_unexpected_data']: TVLA_TO_MC_DO_NOT_CHANGE;
+ 
+  if (isset($form_state['values']['op']) && $form_state['values']['op']=='Start') {
+   
+    $unexpected_data=$form_state['values']['behavior_unexpected_data'];
+    simplenews_to_mailchimp ($unexpected_data);
+    
   }
   $form_state['rebuild'] = TRUE;
 }
@@ -691,9 +819,10 @@ function tvla_simplenews_to_mailchimp_form_alter(&$form, &$form_state, $form_id)
   
   if ($form_id=='simplenews_to_mailchimp_config_form') {
   
-    if (isset($form_state['input']['op'])) {
+    if (isset($form_state['input']['op']) && $form_state['input']['op']=='Start') {
       $form['contact']['elements']['passed']=array ('#type'=>'markup',
-                                                    '#markup' => '<div> Synchronization passed </div>');
+                                                    '#markup' => '<div> Synchronization passed </div>',
+                                                    '#weight'=>16);
     } 
   } 
 }
@@ -725,7 +854,7 @@ function simplenews_to_mailchimp_test_delete ($prefix, $email_suff , $count) {
  * @return
  */
 
-function simplenews_to_mailchimp_test_create ($prefix, $email_suff , $count, $tid) {
+function simplenews_to_mailchimp_test_create ($prefix, $email_suff , $count, $tid){
   
   for ($i=0; $i<$count; $i++) {
     $name=$prefix.$i;
@@ -742,6 +871,152 @@ function simplenews_to_mailchimp_test_create ($prefix, $email_suff , $count, $ti
     user_save(null, $newUser);
     simplenews_subscribe_user($email, $tid,false);
   }
-} 
+}
+
+function tvla_simplenews_to_mailchimp_cron () {
+  $auto_update=variable_get('simple_news_to_mailchimp_auto_update',TVLA_TO_MC_NO_AUTOMATIC_UPDATE);
+  if ($auto_update==TVLA_TO_MC_UPDATE_USING_CRON) {
+    tvla_simplenews_to_mailchimp_flush_emails_from_db_to_mc ();
+  }
+  
+}
+
+function tvla_simplenews_to_mailchimp_flush_emails_from_db_to_mc () {
+    if (!db_table_exists("tvla_sn_to_mc_emails")) {
+        return;
+    }
+    $results=null;
+    $query="SELECT id, tid, email FROM tvla_sn_to_mc_emails";
+    $results=db_query($query);
+    if (!empty($results)) {
+        $batch_ops=array ();
+        $ids=array();
+        
+        $sn_cats=simplenews_categories_load_multiple();
+        $mc_lists=simplenews_to_mailchimp_get_mailchimp_lists();
+        $mc_lists_f= tvla_simplenews_to_mailchimp_format_mc_lists($mc_lists);
+    
+   
+        
+        while (($result=$results->fetchObject())!==false) {
+          
+          $tid=$result->tid;
+          $email=$result->email;
+          $group_name=$sn_cats[$tid]->name;
+          $group_name_f=tvla_simplenews_to_mailchimp_format_mc_list_name ($group_name,$tid);
+      
+          $list_id=tvla_simplenews_to_mailchimp_get_mc_list_id ($tid, $mc_lists_f,$sn_cats);
+            
+          $batch_ops['operations'][]=
+            simplenews_to_mailchimp_batch_subscribe_prepare ($list_id, $email);
+          $ids[]=$result->id;
+        }
+        if (!empty($ids)) {
+          $ids_str=join(',',$ids);
+          $query="DELETE FROM tvla_sn_to_mc_emails WHERE id IN ($ids_str) ";
+          db_query($query);
+        }
+        
+        $response=simplenews_to_mailchimp_execute_batch ($batch_ops);
+        return $response;
+    }
+    
+}
+
+//hook_simplenews_subscribe_user
+
+function tvla_simplenews_to_mailchimp_simplenews_subscribe_user($subscriber, $subscription) {
+  
+  $auto_update=variable_get('simple_news_to_mailchimp_auto_update',TVLA_TO_MC_NO_AUTOMATIC_UPDATE);
+
+  if ($auto_update!==TVLA_TO_MC_NO_AUTOMATIC_UPDATE) {  
+    
+    $email=$subscriber->mail;
+    $tid=$subscription->tid;
+    
+    if ($auto_update==TVLA_TO_MC_DIRECT_UPDATE) {
+     
+      $sn_cats=simplenews_categories_load_multiple();
+      $mc_lists=simplenews_to_mailchimp_get_mailchimp_lists();
+      $mc_lists_f= tvla_simplenews_to_mailchimp_format_mc_lists($mc_lists);
+    
+   
+      $group_name=$sn_cats[$tid]->name;
+      $group_name_f=tvla_simplenews_to_mailchimp_format_mc_list_name ($group_name,$tid);
+      
+      $list_id=tvla_simplenews_to_mailchimp_get_mc_list_id ($tid, $mc_lists_f,$sn_cats);
+      
+      $batch_ops['operations'][]=simplenews_to_mailchimp_batch_subscribe_prepare ($list_id, $email);
+      $response=simplenews_to_mailchimp_execute_batch ($batch_ops);
+      return $response;
+    }
+    else if ($auto_update==TVLA_TO_MC_UPDATE_USING_CRON) {
+      db_insert('tvla_sn_to_mc_emails')
+        ->fields( array (
+          'tid' => $tid,
+          'email' => $email))
+        ->execute();
+    }
+  }
+}
+
+function tvla_simplenews_to_mailchimp_get_mc_list_id ($sn_cat_id, &$mc_lists_f,$sn_cats) {
+  
+  $group_name=$sn_cats[$sn_cat_id]->name;
+  $group_name_f=tvla_simplenews_to_mailchimp_format_mc_list_name ($group_name,$sn_cat_id);
+   
+  
+    
+  $list_id=isset ($mc_lists_f['names'][$group_name_f][0]) ? $mc_lists_f['names'][$group_name_f][0] : null;
+    
+  if ($list_id==null) {
+    $cat_data['name']=$sn_cats[$tid]->name;
+    $cat_data['permission_reminder']=variable_get('simple_news_to_mailchimp_reminder');
+    $cat_data['campaign_defaults']=array (
+      'from_email'=>$sn_cats[$sn_cat_id]->from_address,
+      'from_name'=>$sn_cats[$sn_cat_id]->from_name,
+      'subject'=>$sn_cats[$sn_cat_id]->name,
+      'language'=>variable_get('simple_news_to_mailchimp_language'));
+    $response=simplenews_to_mailchimp_new_list_at_mailchimp ($group_name_f,$cat_data);
+    
+    if (is_object($response) && isset($response->id)) {
+      $list_id=$response->id;
+      $mc_lists_f['names'][$group_name_f]=array();
+      $mc_lists_f['names'][$group_name_f][]=$list_id;
+    }  
+       
+  }
+  return $list_id;
+}
+
+function tvla_simplenews_to_mailchimp_test_db () {
+  $query="SELECT * FROM tvla_sn_to_mc_emails";
+  $results=db_query($query);
+  $results_array;
+  while (($result=$results->fetchObject())!==false) {
+      $results_array[]=$result;
+  }
+  return $results_array;
+}
+function tvla_simplenews_to_mailchimp_uninit_db () {
+  if (db_table_exists('tvla_sn_to_mc_emails')) {
+    db_drop_table('tvla_sn_to_mc_emails');
+  }
+}
+
+function tvla_simplenews_to_mailchimp_init_db () {
+    if (!db_table_exists('tvla_sn_to_mc_emails')) {
+      $emails=array (
+        'fields'=> array (
+          'id'=>array(
+            'type' => 'serial', 'unsigned' => TRUE, 'not null' => TRUE),
+          'tid'=> array('type'=>'int', 'not null' => TRUE, ),
+          'email'=> array('type'=>'varchar','length' => 255, 'not null' => TRUE, ),
+          ),
+          'primary key' => array('id')
+    ); 
+    db_create_table('tvla_sn_to_mc_emails', $emails);
+  }
+}
 
 
